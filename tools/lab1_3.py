@@ -50,6 +50,8 @@ struct data_t {
     char mode[32];
     char comm[TASK_COMM_LEN];
     char fname[DNAME_INLINE_LEN];
+    u64 ip;
+
 };
 
 //BPF_HASH(birth, struct dentry *);
@@ -60,6 +62,7 @@ int read_trace(struct pt_regs *ctx, struct file *file,
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     FILTER
     struct data_t data = {};
+    data.ip = PT_REGS_IP(ctx);
 
     //u64 ts = bpf_ktime_get_ns();
     //birth.update(&dentry, &ts);
@@ -92,6 +95,7 @@ int write_trace(struct pt_regs *ctx, struct file *file,
     u32 pid = bpf_get_current_pid_tgid() >> 32;
     FILTER
     struct data_t data = {};
+    data.ip = PT_REGS_IP(ctx);
 
     //u64 ts = bpf_ktime_get_ns();
     //birth.update(&dentry, &ts);
@@ -158,6 +162,7 @@ def print_event(cpu, data, size):
         rw = "READ"
     else:
         rw = "WRITE"
+    print(b.ksym(event.ip))
     print("%-8s %-6d %-10s %-16s %-16s %-32s" % (strftime("%H:%M:%S"), event.pid, rw,
         event.comm.decode('utf-8', 'replace'),
         event.fname.decode('utf-8', 'replace'), event.mode))

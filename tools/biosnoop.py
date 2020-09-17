@@ -41,6 +41,7 @@ bpf_text="""
 
 struct val_t {
     u64 ts;
+    u64 len;
     u32 pid;
     char name[TASK_COMM_LEN];
 };
@@ -69,6 +70,7 @@ int trace_pid_start(struct pt_regs *ctx, struct request *req)
 
     if (bpf_get_current_comm(&val.name, sizeof(val.name)) == 0) {
         val.pid = bpf_get_current_pid_tgid() >> 32;
+        val.len = req->__data_len;
         if (##QUEUE##) {
             val.ts = bpf_ktime_get_ns();
         }
@@ -115,7 +117,8 @@ int trace_req_completion(struct pt_regs *ctx, struct request *req)
             data.qdelta = *tsp - valp->ts;
         }
         data.pid = valp->pid;
-        data.len = req->__data_len;
+        //data.len = req->__data_len;
+        data.len = valp->len;
         data.sector = req->__sector;
         bpf_probe_read_kernel(&data.name, sizeof(data.name), valp->name);
         struct gendisk *rq_disk = req->rq_disk;
@@ -189,14 +192,14 @@ def print_event(cpu, data, size):
         rwflg = "R"
 
     delta = float(event.ts) - start_ts
-
-    print("%-11.6f %-14.14s %-6s %-7s %-1s %-10s %-7s" % (
-        delta / 1000000, event.name.decode('utf-8', 'replace'), event.pid,
-        event.disk_name.decode('utf-8', 'replace'), rwflg, event.sector,
-        event.len), end="")
-    if args.queue:
-        print("%7.2f " % (float(event.qdelta) / 1000000), end="")
-    print("%7.2f" % (float(event.delta) / 1000000))
+    if event.name.decode('utf-8', 'replace') != "?":
+        print("%-11.6f %-14.14s %-6s %-7s %-1s %-10s %-7s" % (
+            delta / 1000000, event.name.decode('utf-8', 'replace'), event.pid,
+            event.disk_name.decode('utf-8', 'replace'), rwflg, event.sector,
+            event.len), end="")
+        if args.queue:
+            print("%7.2f " % (float(event.qdelta) / 1000000), end="")
+        print("%7.2f" % (float(event.delta) / 1000000))
 
 # loop with callback to print_event
 b["events"].open_perf_buffer(print_event, page_cnt=64)

@@ -41,6 +41,7 @@ bpf_text="""
 
 struct val_t {
     u64 ts;
+    u64 len;
     u32 pid;
     char name[TASK_COMM_LEN];
 };
@@ -69,9 +70,7 @@ int trace_pid_start(struct pt_regs *ctx, struct request *req)
 
     if (bpf_get_current_comm(&val.name, sizeof(val.name)) == 0) {
         val.pid = bpf_get_current_pid_tgid() >> 32;
-        if (##QUEUE##) {
-            val.ts = bpf_ktime_get_ns();
-        }
+        val.len = req->__data_len;
         infobyreq.update(&req, &val);
     }
     return 0;
@@ -111,11 +110,9 @@ int trace_req_completion(struct pt_regs *ctx, struct request *req)
         data.name[0] = '?';
         data.name[1] = 0;
     } else {
-        if (##QUEUE##) {
-            data.qdelta = *tsp - valp->ts;
-        }
         data.pid = valp->pid;
-        data.len = req->__data_len;
+        //data.len = req->__data_len;
+        data.len = valp->len;
         data.sector = req->__sector;
         bpf_probe_read_kernel(&data.name, sizeof(data.name), valp->name);
         struct gendisk *rq_disk = req->rq_disk;
@@ -164,31 +161,42 @@ b.attach_kprobe(event="blk_account_io_done",
     fn_name="trace_req_completion")
 
 # header
-print("%-11s %-14s %-6s %-7s %-1s %-10s %-7s" % ("TIME(s)", "COMM", "PID",
-    "DISK", "T", "SECTOR", "BYTES"), end="")
+print("%-11s %-14s %-6s %-7s %-1s %-10s %-7s %-10s" % ("TIME(s)", "COMM", "PID",
+    "DISK", "T", "SECTOR", "BYTES", "PATTERN"), end="")
 if args.queue:
     print("%7s " % ("QUE(ms)"), end="")
 print("%7s" % "LAT(ms)")
 
 rwflg = ""
 start_ts = 0
-prev_ts = 0
 delta = 0
 
 prev_sector = -1
 cur_sector = -1
+prev_pid = -1
 
 # process event
 def print_event(cpu, data, size):
     event = b["events"].event(data)
     global prev_sector
     global cur_sector
+    global prev_delta
+    global prev_pid
+    if prev_pid != event.pid:
+        prev_pid = event.pid
+        prev_sector = -1
+        cur_sector = -1
+
     prev_sector = cur_sector
     cur_sector = event.sector
-    if prev_sector!=-1 and prev_sector+event.len == cur_sector:
-        print("SEQUENTIAL")
+    pattern = ""
+    if prev_sector!=-1 and (prev_sector+event.len/512 == cur_sector):
+        pattern = "SEQUENTIAL"
     elif prev_sector != -1:
-        print("RANDOM")
+        pattern = "RANDOM"
+    else:
+        pattern = "-"
+
     global start_ts
     if start_ts == 0:
         start_ts = event.ts
@@ -199,14 +207,14 @@ def print_event(cpu, data, size):
         rwflg = "R"
 
     delta = float(event.ts) - start_ts
-
-    print("%-11.6f %-14.14s %-6s %-7s %-1s %-10s %-7s" % (
-        delta / 1000000, event.name.decode('utf-8', 'replace'), event.pid,
-        event.disk_name.decode('utf-8', 'replace'), rwflg, event.sector,
-        event.len), end="")
-    if args.queue:
-        print("%7.2f " % (float(event.qdelta) / 1000000), end="")
-    print("%7.2f" % (float(event.delta) / 1000000))
+    if event.name.decode('utf-8', 'replace') != "?":
+        print("%-11.6f %-14.14s %-6s %-7s %-1s %-10s %-7d " % (
+            delta / 1000000, event.name.decode('utf-8', 'replace'), event.pid,
+            event.disk_name.decode('utf-8', 'replace'), rwflg, event.sector,
+            event.len), end="")
+        if args.queue:
+            print("%7.2f " % (float(event.qdelta) / 1000000), end="")
+        print("%-10s %7f" % (pattern, float(event.delta) / 1000000))
 
 # loop with callback to print_event
 b["events"].open_perf_buffer(print_event, page_cnt=64)
