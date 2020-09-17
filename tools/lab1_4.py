@@ -1,78 +1,67 @@
 #!/usr/bin/python
-# @lint-avoid-python-3-compatibility-imports
-#
-# biosnoop  Trace block device I/O and print details including issuing PID.
-#           For Linux, uses BCC, eBPF.
-#
-# This uses in-kernel eBPF maps to cache process details (PID and comm) by I/O
-# request, as well as a starting timestamp for calculating I/O latency.
-#
-# Copyright (c) 2015 Brendan Gregg.
-# Licensed under the Apache License, Version 2.0 (the "License")
-#
-# 16-Sep-2015   Brendan Gregg   Created this.
-# 11-Feb-2016   Allan McAleavy  updated for BPF_PERF_OUTPUT
 
 from __future__ import print_function
 from bcc import BPF
-import re
-import argparse
+from time import sleep, strftime
+import signal
+from subprocess import call
 
-# arguments
-examples = """examples:
-    ./biosnoop           # trace all block I/O
-    ./biosnoop -Q        # include OS queued time
-"""
-parser = argparse.ArgumentParser(
-    description="Trace block I/O",
-    formatter_class=argparse.RawDescriptionHelpFormatter,
-    epilog=examples)
-parser.add_argument("-Q", "--queue", action="store_true",
-    help="include OS queued time")
-parser.add_argument("--ebpf", action="store_true",
-    help=argparse.SUPPRESS)
-args = parser.parse_args()
-debug = 0
+interval = 99999999
 
-# define BPF program
-bpf_text="""
+# linux stats
+diskstats = "/proc/diskstats"
+
+# signal handler
+def signal_ignore(signal_value, frame):
+    print()
+
+# load BPF program
+bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <linux/blkdev.h>
 
-struct val_t {
-    u64 ts;
-    u64 len;
+// for saving process info by request
+struct who_t {
     u32 pid;
+    u64 sector;
+    u64 len;
     char name[TASK_COMM_LEN];
 };
 
-struct data_t {
+// the key for the output summary
+struct info_t {
     u32 pid;
-    u64 rwflag;
-    u64 delta;
-    u64 qdelta;
-    u64 sector;
-    u64 len;
-    u64 ts;
-    char disk_name[DISK_NAME_LEN];
+    int rwflag;
+    int major;
+    int minor;
     char name[TASK_COMM_LEN];
+};
+
+// the value of the output summary
+struct val_t {
+    u64 prev;
+    u64 seq_rcount;
+    u64 seq_wcount;
+    u64 rand_rcount;
+    u64 rand_wcount;
 };
 
 BPF_HASH(start, struct request *);
-BPF_HASH(infobyreq, struct request *, struct val_t);
-BPF_PERF_OUTPUT(events);
+BPF_HASH(whobyreq, struct request *, struct who_t);
+BPF_HASH(counts, struct info_t, struct val_t);
 
 // cache PID and comm by-req
 int trace_pid_start(struct pt_regs *ctx, struct request *req)
 {
-    struct val_t val = {};
-    u64 ts;
+    struct who_t who = {};
 
-    if (bpf_get_current_comm(&val.name, sizeof(val.name)) == 0) {
-        val.pid = bpf_get_current_pid_tgid() >> 32;
-        val.len = req->__data_len;
-        infobyreq.update(&req, &val);
+    if (bpf_get_current_comm(&who.name, sizeof(who.name)) == 0) {
+        who.pid = bpf_get_current_pid_tgid() >> 32;
+        who.len = req->__data_len;
+        who.sector = req->__sector;
+        whobyreq.update(&req, &who);
     }
+
     return 0;
 }
 
@@ -80,8 +69,10 @@ int trace_pid_start(struct pt_regs *ctx, struct request *req)
 int trace_req_start(struct pt_regs *ctx, struct request *req)
 {
     u64 ts;
+
     ts = bpf_ktime_get_ns();
     start.update(&req, &ts);
+
     return 0;
 }
 
@@ -89,37 +80,21 @@ int trace_req_start(struct pt_regs *ctx, struct request *req)
 int trace_req_completion(struct pt_regs *ctx, struct request *req)
 {
     u64 *tsp;
-    struct val_t *valp;
-    struct data_t data = {};
-    u64 ts;
 
     // fetch timestamp and calculate delta
     tsp = start.lookup(&req);
     if (tsp == 0) {
-        // missed tracing issue
-        return 0;
-    }
-    ts = bpf_ktime_get_ns();
-    data.delta = ts - *tsp;
-    data.ts = ts / 1000;
-    data.qdelta = 0;
-
-    valp = infobyreq.lookup(&req);
-    if (valp == 0) {
-        data.len = req->__data_len;
-        data.name[0] = '?';
-        data.name[1] = 0;
-    } else {
-        data.pid = valp->pid;
-        //data.len = req->__data_len;
-        data.len = valp->len;
-        data.sector = req->__sector;
-        bpf_probe_read_kernel(&data.name, sizeof(data.name), valp->name);
-        struct gendisk *rq_disk = req->rq_disk;
-        bpf_probe_read_kernel(&data.disk_name, sizeof(data.disk_name),
-                       rq_disk->disk_name);
+        return 0;    // missed tracing issue
     }
 
+    struct who_t *whop;
+    struct val_t *valp, zero = {};
+    u64 delta_us = (bpf_ktime_get_ns() - *tsp) / 1000;
+
+    // setup info_t key
+    struct info_t info = {};
+    info.major = req->rq_disk->major;
+    info.minor = req->rq_disk->first_minor;
 /*
  * The following deals with a kernel version change (in mainline 4.7, although
  * it may be backported to earlier kernels) with how block request write flags
@@ -128,30 +103,55 @@ int trace_req_completion(struct pt_regs *ctx, struct request *req)
  * test, and maintenance burden.
  */
 #ifdef REQ_WRITE
-    data.rwflag = !!(req->cmd_flags & REQ_WRITE);
+    info.rwflag = !!(req->cmd_flags & REQ_WRITE);
 #elif defined(REQ_OP_SHIFT)
-    data.rwflag = !!((req->cmd_flags >> REQ_OP_SHIFT) == REQ_OP_WRITE);
+    info.rwflag = !!((req->cmd_flags >> REQ_OP_SHIFT) == REQ_OP_WRITE);
 #else
-    data.rwflag = !!((req->cmd_flags & REQ_OP_MASK) == REQ_OP_WRITE);
+    info.rwflag = !!((req->cmd_flags & REQ_OP_MASK) == REQ_OP_WRITE);
 #endif
 
-    events.perf_submit(ctx, &data, sizeof(data));
+    whop = whobyreq.lookup(&req);
+    if (whop == 0) {
+        // missed pid who, save stats as pid 0
+        valp = counts.lookup_or_try_init(&info, &zero);
+    } else {
+        info.pid = whop->pid;
+        __builtin_memcpy(&info.name, whop->name, sizeof(info.name));
+        valp = counts.lookup_or_try_init(&info, &zero);
+    }
+
+    if (valp) {
+        // save stats
+        u64 cur_sector;
+        u64 cur_len;
+        bpf_probe_read_kernel(&cur_sector, sizeof(cur_sector), &whop->sector);
+        bpf_probe_read_kernel(&cur_len, sizeof(cur_len), &whop->len);
+        if (valp->prev == cur_sector || valp->prev == 0) {
+            if(info.rwflag==1){
+                valp->seq_wcount++;
+            }
+            else{
+                valp->seq_rcount++;
+            }
+        }
+        else{
+            if(info.rwflag==1){
+                valp->rand_wcount++;
+            }
+            else{
+                valp->rand_rcount++;
+            }
+        }
+        valp->prev = cur_len/512 + cur_sector;
+    }
+
     start.delete(&req);
-    infobyreq.delete(&req);
+    whobyreq.delete(&req);
 
     return 0;
 }
 """
-if args.queue:
-    bpf_text = bpf_text.replace('##QUEUE##', '1')
-else:
-    bpf_text = bpf_text.replace('##QUEUE##', '0')
-if debug or args.ebpf:
-    print(bpf_text)
-    if args.ebpf:
-        exit()
 
-# initialize BPF
 b = BPF(text=bpf_text)
 b.attach_kprobe(event="blk_account_io_start", fn_name="trace_pid_start")
 if BPF.get_kprobe_functions(b'blk_start_request'):
@@ -160,66 +160,37 @@ b.attach_kprobe(event="blk_mq_start_request", fn_name="trace_req_start")
 b.attach_kprobe(event="blk_account_io_done",
     fn_name="trace_req_completion")
 
-# header
-print("%-11s %-14s %-6s %-7s %-1s %-10s %-7s %-10s" % ("TIME(s)", "COMM", "PID",
-    "DISK", "T", "SECTOR", "BYTES", "PATTERN"), end="")
-if args.queue:
-    print("%7s " % ("QUE(ms)"), end="")
-print("%7s" % "LAT(ms)")
+print('Tracing... Hit Ctrl-C to end.')
 
-rwflg = ""
-start_ts = 0
-delta = 0
+# cache disk major,minor -> diskname
+disklookup = {}
+with open(diskstats) as stats:
+    for line in stats:
+        a = line.split()
+        disklookup[a[0] + "," + a[1]] = a[2]
 
-prev_sector = -1
-cur_sector = -1
-prev_pid = -1
+# output
+exiting = 0
+try:
+    sleep(interval)
+except KeyboardInterrupt:
+    exiting = 1
 
-# process event
-def print_event(cpu, data, size):
-    event = b["events"].event(data)
-    global prev_sector
-    global cur_sector
-    global prev_delta
-    global prev_pid
-    if prev_pid != event.pid:
-        prev_pid = event.pid
-        prev_sector = -1
-        cur_sector = -1
+print("\n%-6s %-16s %-3s %-3s %-8s %-10s %-10s %-10s %-10s" % ("PID", "COMM", "MAJ", "MIN", "DISK", "SEQ_READ", "SEQ_WRITE", "RAND_READ", "RAND_WRITE"))
 
-    prev_sector = cur_sector
-    cur_sector = event.sector
-    pattern = ""
-    if prev_sector!=-1 and (prev_sector+event.len/512 == cur_sector):
-        pattern = "SEQUENTIAL"
-    elif prev_sector != -1:
-        pattern = "RANDOM"
+# by-PID output
+counts = b.get_table("counts")
+for k, v in reversed(sorted(counts.items(),
+                            key=lambda counts: counts[1].seq_rcount)):
+
+    # lookup disk
+    disk = str(k.major) + "," + str(k.minor)
+    if disk in disklookup:
+        diskname = disklookup[disk]
     else:
-        pattern = "-"
+        diskname = "?"
 
-    global start_ts
-    if start_ts == 0:
-        start_ts = event.ts
-
-    if event.rwflag == 1:
-        rwflg = "W"
-    else:
-        rwflg = "R"
-
-    delta = float(event.ts) - start_ts
-    if event.name.decode('utf-8', 'replace') != "?":
-        print("%-11.6f %-14.14s %-6s %-7s %-1s %-10s %-7d " % (
-            delta / 1000000, event.name.decode('utf-8', 'replace'), event.pid,
-            event.disk_name.decode('utf-8', 'replace'), rwflg, event.sector,
-            event.len), end="")
-        if args.queue:
-            print("%7.2f " % (float(event.qdelta) / 1000000), end="")
-        print("%-10s %7f" % (pattern, float(event.delta) / 1000000))
-
-# loop with callback to print_event
-b["events"].open_perf_buffer(print_event, page_cnt=64)
-while 1:
-    try:
-        b.perf_buffer_poll()
-    except KeyboardInterrupt:
-        exit()
+    if diskname=="sda":
+        print("%-6s %-16s %-3d %-3d %-8s %-10s %-10s %-10s %-10s" % (k.pid,
+            k.name.decode('utf-8', 'replace'),
+            k.major, k.minor, diskname, v.seq_rcount, v.seq_wcount, v.rand_rcount, v.rand_wcount))
